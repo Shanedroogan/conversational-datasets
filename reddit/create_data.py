@@ -13,13 +13,14 @@ import re
 import uuid
 from collections import defaultdict, namedtuple
 from functools import partial
+import random
 
 import apache_beam as beam
-import tensorflow as tf
+# import tensorflow as tf
 from apache_beam import pvalue
 from apache_beam.io import BigQuerySource, Read
 from apache_beam.io.textio import WriteToText
-from apache_beam.io.tfrecordio import WriteToTFRecord
+# from apache_beam.io.tfrecordio import WriteToTFRecord
 from apache_beam.options.pipeline_options import PipelineOptions, SetupOptions
 
 _TF_FORMAT = "TF"
@@ -52,7 +53,7 @@ def _parse_args(argv=None):
     parser.add_argument(
         "--dataset_format",
         choices={_TF_FORMAT, _JSON_FORMAT},
-        default="TF",
+        default="JSON",
         help="The dataset format to write. 'TF' for serialized tensorflow "
              "examples in TFRecords. 'JSON' for text files with one JSON "
              "object per line."
@@ -82,15 +83,21 @@ def _parse_args(argv=None):
     )
     parser.add_argument(
         "--num_shards_test",
-        default=100,
+        default=10,
         type=_positive_int,
         help="The number of shards for the test set.",
     )
     parser.add_argument(
         "--num_shards_train",
-        default=1000,
+        default=100,
         type=_positive_int,
         help="The number of shards for the train set.",
+    )
+    parser.add_argument(
+        "--max_num_workers",
+        default=500,
+        type=_positive_int,
+        help="The maximum number of workers for the Dataflow Job"
     )
     return parser.parse_known_args(argv)
 
@@ -153,6 +160,51 @@ def _should_skip(comment, min_length):
     return False
 
 
+def create_threddit_examples(thread, parent_depth, min_length, format):
+    """Creates serialized tensorflow examples from a reddit thread."""
+    id_to_comment = {comment.id: comment for comment in list(thread)}
+
+    for path in threddit_paths(id_to_comment, parent_depth):
+
+        parent = id_to_comment[path[0]]
+        response_0 = id_to_comment[path[1]]
+        child_0 = id_to_comment[path[2]]
+        response_1 = id_to_comment[path[3]]
+        child_1 = id_to_comment[path[4]]
+        response_2 = id_to_comment[path[5]]
+        child_2 = id_to_comment[path[6]]
+        response_3 = id_to_comment[path[7]]
+        child_3 = id_to_comment[path[8]]
+        
+        responses = [response_0, response_1, response_2, response_3]
+        children = [child_0, child_1, child_2, child_3]
+
+        #if (_should_skip(parent, min_length)):
+        #    continue
+        #for response, child in zip(responses, children):
+        #    if(_should_skip(response, min_length) or _should_skip(child, min_length)):
+        #        continue
+
+        label = random.randint(0,3)
+
+        response = responses[label]
+
+        example = {}
+        example['subreddit'] = response.subreddit
+        example['thread_id'] = response.thread_id
+        example['parent_author'] = parent.author
+        example['response_author'] = response.author
+        example['parent'] = parent.body
+        example['response'] = response.body
+        example['child_comment_0'] = child_0.body
+        example['child_comment_1'] = child_1.body
+        example['child_comment_2'] = child_2.body
+        example['child_comment_3'] = child_3.body
+        example['label'] = str(label)
+        logging.info('Created Example:',example)
+
+        yield example
+
 def create_examples(thread, parent_depth, min_length, format):
     """Creates serialized tensorflow examples from a reddit thread."""
     id_to_comment = {comment.id: comment for comment in list(thread)}
@@ -161,9 +213,9 @@ def create_examples(thread, parent_depth, min_length, format):
         response = id_to_comment[linear_path[-1]]
         context = id_to_comment[linear_path[-2]]  # guaranteed to exist.
 
-        if (_should_skip(response, min_length)
-                or _should_skip(context, min_length)):
-            continue
+        # if (_should_skip(response, min_length)
+        #         or _should_skip(context, min_length)):
+        #     continue
 
         example = {}
         example['subreddit'] = response.subreddit
@@ -172,6 +224,7 @@ def create_examples(thread, parent_depth, min_length, format):
         example['response_author'] = response.author
         example['context'] = context.body
         example['response'] = response.body
+        logging.info('Created Example:',example)
 
         for i in range(parent_depth - 1):
             # Extra contexts start at index -3.
@@ -185,17 +238,66 @@ def create_examples(thread, parent_depth, min_length, format):
 
         yield example
 
+def threddit_paths(id_to_comment, parent_depth):
+    """Gets all linear paths of comments and replies from the thread.
 
-def _features_to_serialized_tf_example(features):
-    """Convert a string dict to a serialized TF example.
-
-    The dictionary maps feature names (strings) to feature values (strings).
+    Each linear path is guaranteed to have at least two comments in it.
     """
-    example = tf.train.Example()
-    for feature_name, feature_value in features.items():
-        example.features.feature[feature_name].bytes_list.value.append(
-            feature_value.encode("utf-8"))
-    return example.SerializeToString()
+    paths = []
+    seen_ids = set()
+    id_to_children = defaultdict(list)
+    for comment_id, comment in id_to_comment.items():
+        id_to_children[comment.parent_id].append(comment_id)
+        if comment.parent_id not in id_to_comment:
+            paths.append([comment_id])
+            seen_ids.add(comment_id)
+
+    """
+    At this point:
+    paths -> list of lists, each containing highest level comment [[c1], [c2], ...]
+    seen_ids -> set of ids encountered set(c1, c2, ...)
+    id_to_children -> dict of all comment ids to list of children   {p1 : [c1,c2],
+                                                                     c1 : [c3,c4,c5,c6],
+                                                                     c2 : [c7,c8,c9],
+                                                                     c3 : [c10], ...}
+    """
+    while paths: #only run if there is >= 1 top level comment
+        new_paths = [] # empty list new_paths will contain list of lists of ids
+        for path in paths: #iterate through top level comments
+            first_id = path[0] # first_id will be first id in path, i.e. the top level comment
+            new_path = [] # list will contain the thread example path
+            if len(id_to_children[first_id]) > 3: # check if parent comment has at least 4 responses 
+                new_path.append(first_id) # parent becomes first entry in path
+                for response_id in id_to_children[first_id]: #iterate through all responses of parent 
+                    if response_id in seen_ids:
+                        # Prevent infinite loops.
+                        continue
+                    if len(id_to_children[response_id]) < 1:
+                        #add to set if response has no child
+                        seen_ids.add(response_id)
+                        continue
+                    seen_ids.add(response_id)
+                    new_path.append(response_id) # add response to parent to path
+                    new_path.append(id_to_children[response_id][0]) # add first child of response to path 
+                    new_paths.append(new_path[-2:]) # append new path to paths
+                    if len(new_path) == 9:
+                        break
+                if len(new_path) == 9:
+                    yield new_path
+                else:
+                    continue
+        paths = new_paths    
+
+# def _features_to_serialized_tf_example(features):
+#     """Convert a string dict to a serialized TF example.
+
+#     The dictionary maps feature names (strings) to feature values (strings).
+#     """
+#     example = tf.train.Example()
+#     for feature_name, feature_value in features.items():
+#         example.features.feature[feature_name].bytes_list.value.append(
+#             feature_value.encode("utf-8"))
+#     return example.SerializeToString()
 
 
 def linear_paths(id_to_comment, parent_depth):
@@ -303,7 +405,7 @@ def run(argv=None, comments=None):
 
     examples = threads | (
         "Create {} examples".format(args.dataset_format) >> beam.FlatMap(
-            partial(create_examples,
+            partial(create_threddit_examples,
                     parent_depth=args.parent_depth,
                     min_length=args.min_length,
                     format=args.dataset_format,
@@ -314,15 +416,15 @@ def run(argv=None, comments=None):
         _TrainTestSplitFn(train_split=args.train_split)
     ).with_outputs(_TrainTestSplitFn.TEST_TAG, _TrainTestSplitFn.TRAIN_TAG)
 
-    if args.dataset_format == _JSON_FORMAT:
-        write_sink = WriteToText
-        file_name_suffix = ".json"
-        serialize_fn = json.dumps
-    else:
-        assert args.dataset_format == _TF_FORMAT
-        write_sink = WriteToTFRecord
-        file_name_suffix = ".tfrecord"
-        serialize_fn = _features_to_serialized_tf_example
+    # if args.dataset_format == _JSON_FORMAT:
+    write_sink = WriteToText
+    file_name_suffix = ".json"
+    serialize_fn = json.dumps
+    # else:
+    #     assert args.dataset_format == _TF_FORMAT
+    #     write_sink = WriteToTFRecord
+    #     file_name_suffix = ".tfrecord"
+    #     serialize_fn = _features_to_serialized_tf_example
 
     for name, tag in [("train", _TrainTestSplitFn.TRAIN_TAG),
                       ("test", _TrainTestSplitFn.TEST_TAG)]:
